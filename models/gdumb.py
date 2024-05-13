@@ -32,6 +32,7 @@ def fit_buffer(self: ContinualModel, epochs):
         it = 0
         while len(all_inputs):
             if it > self.get_debug_iters() and self.args.debug_mode:
+                print("we are in breakkkkkkkkkkkk 222222222222222222222222222222222222222222222222222222222222222")
                 break
             it += 1
             optimizer.zero_grad()
