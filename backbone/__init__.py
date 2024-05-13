@@ -13,8 +13,7 @@ def xavier(m: nn.Module) -> None:
     """
     Applies Xavier initialization to linear modules.
 
-    Args:
-        m: the module to be initialized
+    :param m: the module to be initialized
 
     Example::
         >>> net = nn.Sequential(nn.Linear(10, 10), nn.ReLU())
@@ -32,13 +31,10 @@ def xavier(m: nn.Module) -> None:
 
 def num_flat_features(x: torch.Tensor) -> int:
     """
-    Computes the total number of items except the first (batch) dimension.
+    Computes the total number of items except the first dimension.
 
-    Args:
-        x: input tensor
-
-    Returns:
-        number of item from the second dimension onward
+    :param x: input tensor
+    :return: number of item from the second dimension onward
     """
     size = x.size()[1:]
     num_features = 1
@@ -46,22 +42,7 @@ def num_flat_features(x: torch.Tensor) -> int:
         num_features *= ff
     return num_features
 
-
 class MammothBackbone(nn.Module):
-    """
-    A backbone module for the Mammoth model.
-
-    Args:
-        **kwargs: additional keyword arguments
-
-    Methods:
-        forward: Compute a forward pass.
-        features: Get the features of the input tensor (same as forward but with returnt='features').
-        get_params: Returns all the parameters concatenated in a single tensor.
-        set_params: Sets the parameters to a given value.
-        get_grads: Returns all the gradients concatenated in a single tensor.
-        get_grads_list: Returns a list containing the gradients (a tensor for each layer).
-    """
 
     def __init__(self, **kwargs) -> None:
         super(MammothBackbone, self).__init__()
@@ -69,34 +50,19 @@ class MammothBackbone(nn.Module):
     def forward(self, x: torch.Tensor, returnt='out') -> torch.Tensor:
         """
         Compute a forward pass.
-
-        Args:
-            x: input tensor (batch_size, *input_shape)
-            returnt: return type (a string among `out`, `features`, `both`, or `all`)
-
-        Returns:
-            output tensor
+        :param x: input tensor (batch_size, *input_shape)
+        :param returnt: return type (a string among 'out', 'features', 'all')
+        :return: output tensor (output_classes)
         """
         raise NotImplementedError
 
     def features(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the features of the input tensor.
-
-        Args:
-            x: input tensor
-
-        Returns:
-            features tensor
-        """
         return self.forward(x, returnt='features')
 
     def get_params(self) -> torch.Tensor:
         """
         Returns all the parameters concatenated in a single tensor.
-
-        Returns:
-            parameters tensor
+        :return: parameters tensor (??)
         """
         params = []
         for pp in list(self.parameters()):
@@ -106,33 +72,27 @@ class MammothBackbone(nn.Module):
     def set_params(self, new_params: torch.Tensor) -> None:
         """
         Sets the parameters to a given value.
-
-        Args:
-            new_params: concatenated values to be set
+        :param new_params: concatenated values to be set (??)
         """
         assert new_params.size() == self.get_params().size()
         progress = 0
         for pp in list(self.parameters()):
             cand_params = new_params[progress: progress +
-                                     torch.tensor(pp.size()).prod()].view(pp.size())
+                torch.tensor(pp.size()).prod()].view(pp.size())
             progress += torch.tensor(pp.size()).prod()
             pp.data = cand_params
 
     def get_grads(self) -> torch.Tensor:
         """
         Returns all the gradients concatenated in a single tensor.
-
-        Returns:
-            gradients tensor
+        :return: gradients tensor (??)
         """
         return torch.cat(self.get_grads_list())
 
     def get_grads_list(self):
         """
         Returns a list containing the gradients (a tensor for each layer).
-
-        Returns:
-            gradients list
+        :return: gradients list
         """
         grads = []
         for pp in list(self.parameters()):
