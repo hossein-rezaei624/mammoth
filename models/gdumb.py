@@ -86,5 +86,6 @@ class GDumb(ContinualModel):
         # new model
         if not (self.current_task == dataset.N_TASKS - 1):
             return
+        print("lasttttttttttttttttttt oneeeeeeeeeeeeeeeeeeeeeeee")
         self.net = dataset.get_backbone().to(self.device)
         fit_buffer(self, self.args.fitting_epochs)
