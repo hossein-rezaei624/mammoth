@@ -1764,6 +1764,7 @@ best_args = {
                   'minibatch_size': 32,
                   'batch_size': 32,
                   'n_epochs': 1,
+                  'validation': 1,
                   'optim_mom': 0,
                   'optim_wd': 0},
             1000: {'lr': 0.1,
