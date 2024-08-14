@@ -524,7 +524,7 @@ best_args = {
                            500: {'lr': 0.1,
                                  'minibatch_size': 32,
                                  'batch_size': 32,
-                                 'n_epochs': 1},
+                                 'n_epochs': 50},
                            5120: {'lr': 0.1,
                                   'minibatch_size': 32,
                                   'batch_size': 32,
