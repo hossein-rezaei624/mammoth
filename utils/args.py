@@ -68,8 +68,7 @@ def add_experiment_args(parser: ArgumentParser) -> None:
                         help='Train model on Joint (single task)?')
     parser.add_argument('--label_perc', type=float, default=1,
                         help='Percentage in (0-1] of labeled examples per task.')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='The random seed.')
+
 
 def add_management_args(parser: ArgumentParser) -> None:
     """
@@ -81,7 +80,8 @@ def add_management_args(parser: ArgumentParser) -> None:
     Returns:
         None
     """
-
+    parser.add_argument('--seed', type=int, default=0,
+                        help='The random seed.')
     parser.add_argument('--permute_classes', type=int, choices=[0, 1], default=0,
                         help='Permute classes before splitting tasks (applies seed before permute if seed is present)?')
     parser.add_argument('--base_path', type=str, default="./data/",
