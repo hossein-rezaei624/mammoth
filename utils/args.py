@@ -80,7 +80,7 @@ def add_management_args(parser: ArgumentParser) -> None:
     Returns:
         None
     """
-    parser.add_argument('--seed', type=int, default=None,
+    parser.add_argument('--seed', type=int,
                         help='The random seed.')
     parser.add_argument('--permute_classes', type=int, choices=[0, 1], default=0,
                         help='Permute classes before splitting tasks (applies seed before permute if seed is present)?')
