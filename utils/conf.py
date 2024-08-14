@@ -93,6 +93,9 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     try:
         torch.cuda.manual_seed_all(seed)
+        ##torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     except BaseException:
         print('Could not set cuda seed.')
 
