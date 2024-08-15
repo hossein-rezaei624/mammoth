@@ -873,6 +873,25 @@ best_args = {
         },
 
 
+        'gss': {300: {'lr': 0.03,
+                      'minibatch_size': 32,
+                      'gss_minibatch_size': 32,
+                      'batch_size': 32,
+                      'n_epochs': 50,
+                      'batch_num': 1},
+                500: {'lr': 0.03,
+                      'minibatch_size': 32,
+                      'gss_minibatch_size': 32,
+                      'batch_size': 32,
+                      'n_epochs': 50,
+                      'batch_num': 1},
+                1000: {'lr': 0.03,
+                      'minibatch_size': 32,
+                      'gss_minibatch_size': 32,
+                      'batch_size': 32,
+                      'n_epochs': 1,
+                      'batch_num': 1}},
+          
         'icarl': {
             500: {'lr': 0.3, 'optim_mom': 0, 'optim_wd': 1e-05},
             2000: {'lr': 0.3, 'optim_mom': 0, 'optim_wd': 1e-05}
