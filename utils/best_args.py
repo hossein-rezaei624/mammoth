@@ -536,7 +536,7 @@ best_args = {
                             500: {'lr': 0.03, 'gamma': 0.5,
                                   'batch_size': 32,
                                   'n_epochs': 50},
-                            5120: {'lr': 0.03, 'gamma': 0.5,
+                            1000: {'lr': 0.03, 'gamma': 0.5,
                                    'batch_size': 32,
                                    'n_epochs': 50}},
                     'agem': {200: {'lr': 0.03,
