@@ -865,6 +865,23 @@ best_args = {
             500: {'lr': 0.1, 'optim_mom': 0, 'optim_wd': 0},
             2000: {'lr': 0.1, 'optim_mom': 0, 'optim_wd': 0}
         },
+
+
+        'agem': {200: {'lr': 0.03,
+                       'minibatch_size': 32,
+                       'batch_size': 32,
+                       'n_epochs': 50},
+                 500: {'lr': 0.03,
+                       'minibatch_size': 32,
+                       'batch_size': 32,
+                       'n_epochs': 50},
+                 5120: {'lr': 0.03,
+                        'minibatch_size': 32,
+                        'batch_size': 32,
+                        'n_epochs': 50}},
+
+
+          
         'gdumb': {
             500: {'lr': 0.1, 'maxlr': 0.05, 'minlr': 5e-4, 'cutmix_alpha': 1, 'fitting_epochs': 250, 'optim_mom': 0.9, 'optim_wd': 1e-6},
             2000: {'lr': 0.1, 'maxlr': 0.05, 'minlr': 5e-4, 'cutmix_alpha': 1, 'fitting_epochs': 250, 'optim_mom': 0, 'optim_wd': 1e-6},
