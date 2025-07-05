@@ -1,855 +1,490 @@
-# Copyright 2022-present, Lorenzo Bonicelli, Pietro Buzzega, Matteo Boschini, Angelo Porrello, Simone Calderara.
-# All rights reserved.
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-from argparse import Namespace
-from copy import deepcopy
-import logging
-from typing import List, Tuple, TYPE_CHECKING
-
-import numpy as np
 import torch
+from utils.buffer import Buffer
+from utils.args import *
+from models.utils.continual_model import ContinualModel
+from utils.acr_loss import SupConLoss
+from utils.acr_transforms_aug import transforms_aug
+
 import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision
 
-from utils.augmentations import apply_transform
-from utils.conf import create_seeded_dataloader, get_device
+import torch.nn.functional as F
+import math
 
-if TYPE_CHECKING:
-    from models.utils.continual_model import ContinualModel
-    from datasets.utils.continual_dataset import ContinualDataset
-    from backbone import MammothBackbone
-
-
-def icarl_replay(self: 'ContinualModel', dataset: 'ContinualDataset', val_set_split=0):
-    """
-    Merge the replay buffer with the current task data.
-    Optionally split the replay buffer into a validation set.
-
-    Args:
-        self: the model instance
-        dataset: the dataset
-        val_set_split: the fraction of the replay buffer to be used as validation set
-    """
-
-    if self.current_task > 0:
-        buff_val_mask = torch.rand(len(self.buffer)) < val_set_split
-        val_train_mask = torch.zeros(len(dataset.train_loader.dataset.data)).bool()
-        val_train_mask[torch.randperm(len(dataset.train_loader.dataset.data))[:buff_val_mask.sum()]] = True
-
-        if val_set_split > 0:
-            self.val_dataset = deepcopy(dataset.train_loader.dataset)
-
-        data_concatenate = torch.cat if isinstance(dataset.train_loader.dataset.data, torch.Tensor) else np.concatenate
-        need_aug = hasattr(dataset.train_loader.dataset, 'not_aug_transform')
-        if not need_aug:
-            def refold_transform(x): return x.cpu()
-        else:
-            data_shape = len(dataset.train_loader.dataset.data[0].shape)
-            if data_shape == 3:
-                def refold_transform(x): return (x.cpu() * 255).permute([0, 2, 3, 1]).numpy().astype(np.uint8)
-            elif data_shape == 2:
-                def refold_transform(x): return (x.cpu() * 255).squeeze(1).type(torch.uint8)
-
-        # REDUCE AND MERGE TRAINING SET
-        dataset.train_loader.dataset.targets = np.concatenate([
-            dataset.train_loader.dataset.targets[~val_train_mask],
-            self.buffer.labels.cpu().numpy()[:len(self.buffer)][~buff_val_mask]
-        ])
-        dataset.train_loader.dataset.data = data_concatenate([
-            dataset.train_loader.dataset.data[~val_train_mask],
-            refold_transform((self.buffer.examples)[:len(self.buffer)][~buff_val_mask])
-        ])
-
-        if val_set_split > 0:
-            # REDUCE AND MERGE VALIDATION SET
-            self.val_dataset.targets = np.concatenate([
-                self.val_dataset.targets[val_train_mask],
-                self.buffer.labels.cpu().numpy()[:len(self.buffer)][buff_val_mask]
-            ])
-            self.val_dataset.data = data_concatenate([
-                self.val_dataset.data[val_train_mask],
-                refold_transform((self.buffer.examples)[:len(self.buffer)][buff_val_mask])
-            ])
-
-            self.val_loader = create_seeded_dataloader(self.args, self.val_dataset, batch_size=self.args.batch_size, shuffle=True)
+from collections import defaultdict
+import random
 
 
-class BaseSampleSelection:
-    """
-    Base class for sample selection strategies.
-    """
-
-    def __init__(self, buffer_size: int, device):
+class WeightedProxyContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.09, class_weights=None, label_freq_flag=False):
         """
-        Initialize the sample selection strategy.
-
         Args:
-            buffer_size: the maximum buffer size
-            device: the device to store the buffer on
+            temperature (float): Temperature scaling factor.
+            class_weights (dict or torch.Tensor, optional): Mapping from class index to weight.
+                (If None, all classes are assumed to have weight 1.)
         """
-        self.buffer_size = buffer_size
-        self.device = device
+        super(WeightedProxyContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.class_weights = class_weights
+        self.label_freq_flag = label_freq_flag
 
-    def __call__(self, num_seen_examples: int) -> int:
+    def forward(self, anchor_features, labels, proxies):
         """
-        Selects the index of the sample to replace.
-
         Args:
-            num_seen_examples: the number of seen examples
-
+            anchor_features (Tensor): Features of shape (N, d) for N anchor samples.
+            labels (Tensor): Ground-truth labels for each anchor sample, shape (N,).
+            proxies (Tensor): Proxy vectors (classifier weights) for all classes, shape (C, d).
         Returns:
-            the index of the sample to replace
+            loss (Tensor): The computed weighted proxy contrastive loss (scalar).
         """
-
-        raise NotImplementedError
-
-    def update(self, *args, **kwargs):
-        """
-        (optional) Update the state of the sample selection strategy.
-        """
-        pass
-
-
-class ReservoirSampling(BaseSampleSelection):
-    def __call__(self, num_seen_examples: int) -> int:
-        """
-        Reservoir sampling algorithm.
-
-        Args:
-            num_seen_examples: the number of seen examples
-            buffer_size: the maximum buffer size
-
-        Returns:
-            the target index if the current image is sampled, else -1
-        """
-        if num_seen_examples < self.buffer_size:
-            return num_seen_examples
-
-        rand = np.random.randint(0, num_seen_examples + 1)
-        if rand < self.buffer_size:
-            return rand
+        # Normalize features and proxies to obtain cosine similarities.
+        anchor_features = F.normalize(anchor_features, p=2, dim=1, eps=1e-6)
+        proxies = F.normalize(proxies, p=2, dim=1, eps=1e-6)
+        
+        # Compute similarity matrix (N x C) and scale by temperature.
+        sim_matrix = torch.matmul(anchor_features, proxies.t()) / self.temperature
+        
+        # Numerical stability: subtract the maximum value per row.
+        sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+        logits = sim_matrix - sim_max.detach()  # logits now is stable
+            
+        # Compute exp(logits)
+        exp_logits = torch.exp(logits)
+            
+        # Build weight vector (if provided) or use ones.
+        if self.class_weights is None:
+            weight_vector = torch.ones(proxies.shape[0], device=anchor_features.device, dtype=anchor_features.dtype)
         else:
-            return -1
-
-
-class BalancoirSampling(BaseSampleSelection):
-    def __init__(self, buffer_size: int, device):
-        super().__init__(buffer_size, device)
-        self.unique_map = np.empty((0,), dtype=np.int32)
-
-    def update_unique_map(self, label_in, label_out=None):
-        while len(self.unique_map) <= label_in:
-            self.unique_map = np.concatenate((self.unique_map, np.zeros((len(self.unique_map) * 2 + 1), dtype=np.int32)), axis=0)
-        self.unique_map[label_in] += 1
-        if label_out is not None:
-            self.unique_map[label_out] -= 1
-
-    def __call__(self, num_seen_examples: int, labels: torch.Tensor, proposed_class: int) -> int:
-        """
-        Balancoir sampling algorithm.
-
-        Args:
-            num_seen_examples: the number of seen examples
-            buffer_size: the maximum buffer size
-            labels: the set of buffer labels
-            proposed_class: the class of the current example
-
-        Returns:
-            the target index if the current image is sampled, else -1
-        """
-        if num_seen_examples < self.buffer_size:
-            return num_seen_examples
-
-        rand = np.random.randint(0, num_seen_examples + 1)
-        if rand < self.buffer_size or len(self.unique_map) <= proposed_class or self.unique_map[proposed_class] < np.median(
-                self.unique_map[self.unique_map > 0]):
-            target_class = np.argmax(self.unique_map)
-            # e = rand % self.unique_map.max()
-            idx = np.arange(self.buffer_size)[labels.cpu() == target_class][rand % self.unique_map.max()]
-            return idx
-        else:
-            return -1
-
-
-class LARSSampling(BaseSampleSelection):
-    def __init__(self, buffer_size: int, device):
-        super().__init__(buffer_size, device)
-        # lossoir scores
-        self.importance_scores = torch.ones(buffer_size, device=device) * -float('inf')
-
-    def update(self, indexes: torch.Tensor, values: torch.Tensor):
-        self.importance_scores[indexes] = values
-
-    def normalize_scores(self, values: torch.Tensor):
-        if values.shape[0] > 0:
-            if values.max() - values.min() != 0:
-                values = (values - values.min()) / ((values.max() - values.min()) + 1e-9)
-            return values
-        else:
-            return None
-
-    def __call__(self, num_seen_examples: int) -> int:
-        if num_seen_examples < self.buffer_size:
-            return num_seen_examples
-
-        rn = np.random.randint(0, num_seen_examples)
-        if rn < self.buffer_size:
-            norm_importance = self.normalize_scores(self.importance_scores)
-            norm_importance = norm_importance / (norm_importance.sum() + 1e-9)
-            index = np.random.choice(range(self.buffer_size), p=norm_importance.cpu().numpy(), size=1)
-            return index
-        else:
-            return -1
-
-
-class LossAwareBalancedSampling(BaseSampleSelection):
-    """
-    Combination of Loss-Aware Sampling (LARS) and Balanced Reservoir Sampling (BRS) from `Rethinking Experience Replay: a Bag of Tricks for Continual Learning`.
-    """
-
-    def __init__(self, buffer_size: int, device):
-        super().__init__(buffer_size, device)
-        # lossoir scores
-        self.importance_scores = torch.ones(buffer_size, device=device) * -float('inf')
-        # balancoir scores
-        self.balance_scores = torch.ones(self.buffer_size, dtype=torch.float).to(self.device) * -float('inf')
-        # merged scores
-        self.scores = torch.ones(self.buffer_size).to(self.device) * -float('inf')
-
-    def update(self, indexes: torch.Tensor, values: torch.Tensor):
-        self.importance_scores[indexes] = values
-
-    def merge_scores(self):
-        scaling_factor = self.importance_scores.abs().mean() * self.balance_scores.abs().mean()
-        norm_importance = self.importance_scores / scaling_factor
-        presoftscores = 0.5 * norm_importance + 0.5 * self.balance_scores
-
-        if presoftscores.max() - presoftscores.min() != 0:
-            presoftscores = (presoftscores - presoftscores.min()) / (presoftscores.max() - presoftscores.min() + 1e-9)
-        self.scores = presoftscores / presoftscores.sum()
-
-    def update_balancoir_scores(self, labels: torch.Tensor):
-        unique_labels, orig_inputs_idxs, counts = labels.unique(return_counts=True, return_inverse=True)
-        # assert len(counts) > unique_labels.max(), "Some classes are missing from the buffer"
-        self.balance_scores = torch.gather(counts, 0, orig_inputs_idxs).float()
-
-    def __call__(self, num_seen_examples: int, labels: torch.Tensor) -> int:
-        if num_seen_examples < self.buffer_size:
-            return num_seen_examples
-
-        rn = np.random.randint(0, num_seen_examples)
-        if rn < self.buffer_size:
-            self.update_balancoir_scores(labels)
-            self.merge_scores()
-            index = np.random.choice(range(self.buffer_size), p=self.scores.cpu().numpy(), size=1)
-            return index
-        else:
-            return -1
-
-
-class ABSSampling(LARSSampling):
-    def __init__(self, buffer_size: int, device: str, dataset: 'ContinualDataset'):
-        super().__init__(buffer_size, device)
-        self.dataset = dataset
-
-    def scale_scores(self, past_indexes: torch.Tensor):
-        # due normalizzazioni divere per i due gruppi
-        past_importance = self.normalize_scores(self.importance_scores[past_indexes])
-        current_importance = self.normalize_scores(self.importance_scores[~past_indexes])
-        current_scores, past_scores = None, None
-        if past_importance is not None:
-            past_importance = 1 - past_importance
-            past_scores = past_importance / past_importance.sum()
-        if current_importance is not None:
-            if current_importance.sum() == 0:
-                current_importance += 1e-9
-            current_scores = current_importance / current_importance.sum()
-
-        return past_scores, current_scores
-
-    def __call__(self, num_seen_examples: int, labels: torch.Tensor) -> int:
-        n_seen_classes, _ = self.dataset.get_offsets()
-
-        if num_seen_examples < self.buffer_size:
-            return num_seen_examples
-
-        rn = np.random.randint(0, num_seen_examples)
-        if rn < self.buffer_size:
-            past_indexes = labels < n_seen_classes
-
-            past_scores, current_scores = self.scale_scores(past_indexes)
-            past_percentage = np.float64(past_indexes.sum().cpu() / self.buffer_size)  # avoid numerical issues
-            pres_percetage = 1 - past_percentage
-            assert past_percentage + pres_percetage == 1, f"The sum of the percentages must be 1 but found {past_percentage+pres_percetage}: {past_percentage} + {pres_percetage}"
-            rp = np.random.choice((0, 1), p=[past_percentage, pres_percetage])
-
-            if not rp:
-                index = np.random.choice(np.arange(self.buffer_size)[past_indexes.cpu().numpy()], p=past_scores.cpu().numpy(), size=1)
+            if isinstance(self.class_weights, dict):
+                weight_list = [self.class_weights.get(c, 0.0) for c in range(proxies.shape[0])]
+                weight_vector = torch.tensor(weight_list, device=anchor_features.device, dtype=anchor_features.dtype)
             else:
-                index = np.random.choice(np.arange(self.buffer_size)[~past_indexes.cpu().numpy()], p=current_scores.cpu().numpy(), size=1)
-            return index
+                weight_vector = self.class_weights.to(anchor_features.device)
+        weight_vector = weight_vector.unsqueeze(0)  # Shape: (1, C)
+
+        # Compute frequency of each class in the batch.
+        freq = torch.bincount(labels, minlength=proxies.shape[0]).float().to(anchor_features.device)  # Shape: (C,)
+        freq = freq.unsqueeze(0)  # Shape: (1, C)
+        
+        # Multiply frequency by weight_vector to get effective frequency per class.
+        if self.label_freq_flag:
+            freq_weighted = weight_vector * freq
         else:
-            return -1
+            freq_weighted = weight_vector
+            
+        # Denominator: sum over all classes weighted by frequency.
+        denom = torch.sum(exp_logits * freq_weighted, dim=1, keepdim=True)
+
+        # For each anchor, pick the logit corresponding to its true label.
+        true_logits = logits.gather(1, labels.view(-1, 1))
+            
+        # Compute log probability and loss.
+        log_prob = true_logits - torch.log(denom)
+        loss = -1 * log_prob
+        loss = loss.mean()
+            
+        return loss
 
 
-class Buffer:
-    """
-    The memory buffer of rehearsal method.
-    """
+def get_parser() -> ArgumentParser:
+    parser = ArgumentParser(description='Continual learning via'
+                                        ' Class-Adaptive Sampling Policy.')
+    add_management_args(parser)
+    add_experiment_args(parser)
+    add_rehearsal_args(parser)
+    parser.add_argument('--E', type=int, default=5,
+                        help='Epoch for strategies')
+    
+    return parser
 
-    buffer_size: int  # the maximum size of the buffer
-    device: str  # the device to store the buffer on
-    num_seen_examples: int  # the total number of examples seen, used for reservoir
-    attributes: List[str]  # the attributes stored in the buffer
-    attention_maps: List[torch.Tensor]  # (optional) attention maps used by TwF
-    sample_selection_strategy: str  # the sample selection strategy used to select samples to replace. By default, 'reservoir'
 
-    examples: torch.Tensor  # (mandatory) buffer attribute: the tensor of images
-    labels: torch.Tensor  # (optional) buffer attribute: the tensor of labels
-    logits: torch.Tensor  # (optional) buffer attribute: the tensor of logits
-    task_labels: torch.Tensor  # (optional) buffer attribute: the tensor of task labels
-    true_labels: torch.Tensor  # (optional) buffer attribute: the tensor of true labels
+def distribute_samples(probabilities, M):
+    # Normalize the probabilities
+    total_probability = sum(probabilities.values())
+    normalized_probabilities = {k: v / total_probability for k, v in probabilities.items()}
 
-    def __init__(self, buffer_size: int, device="cpu", sample_selection_strategy='reservoir', **kwargs):
-        """
-        Initialize a reservoir-based Buffer object.
+    # Calculate the number of samples for each class
+    samples = {k: round(v * M) for k, v in normalized_probabilities.items()}
+    
+    # Check if there's any discrepancy due to rounding and correct it
+    discrepancy = M - sum(samples.values())
+    
+    # Adjust the number of samples in each class to ensure the total number of samples equals M
+    for key in samples:
+        if discrepancy == 0:
+            break    # Stop adjusting if there's no discrepancy
+        if discrepancy > 0:
+            # If there are less samples than M, add a sample to the current class and decrease discrepancy
+            samples[key] += 1
+            discrepancy -= 1
+        elif discrepancy < 0 and samples[key] > 0:
+            # If there are more samples than M and the current class has samples, remove one and increase discrepancy
+            samples[key] -= 1
+            discrepancy += 1
 
-        Supports storing images, labels, logits, task_labels, and attention maps. This can be extended by adding more attributes to the `attributes` list and updating the `init_tensors` method accordingly.
+    return samples    # Return the final classes distribution
 
-        To select samples to replace, the buffer supports:
-        - `reservoir` sampling: randomly selects samples to replace (default). Ref: "Jeffrey S Vitter. Random sampling with a reservoir."
-        - `lars`: prioritizes retaining samples with the *higher* loss. Ref: "Pietro Buzzega et al. Rethinking Experience Replay: a Bag of Tricks for Continual Learning."
-        - `labrs` (Loss-Aware Balanced Reservoir Sampling): combination of LARS and BRS. Ref: "Pietro Buzzega et al. Rethinking Experience Replay: a Bag of Tricks for Continual Learning."
-        - `abs` (Asymmetric Balanced Sampling): for samples from the current task, prioritizes retaining samples with the *lower* loss (i.e., inverse `lossoir`); for samples from previous tasks, prioritizes retaining samples with the *higher* loss (i.e., `lossoir`). Useful for settings with noisy labels. Ref: "Monica Millunzi et al. May the Forgetting Be with You: Alternate Replay for Learning with Noisy Labels".
+    
+def distribute_excess(lst, check_bound):
+    # Calculate the total excess value
+    total_excess = sum(val - check_bound for val in lst if val > check_bound)
 
-        Args:
-            buffer_size (int): The maximum size of the buffer.
-            device (str, optional): The device to store the buffer on. Defaults to "cpu".
-            sample_selection_strategy: The sample selection strategy. Defaults to 'reservoir'. Options: 'reservoir', 'lars', 'labrs', 'abs', 'balancoir'.
+    # Number of elements that are not greater than check_bound
+    recipients = [i for i, val in enumerate(lst) if val < check_bound]
 
-        Note:
-            If during the `get_data` the transform is PIL, data will be moved to cpu and then back to the device. This is why the device is set to cpu by default.
-        """
-        self._dl_transform = None
-        self._it_index = 0
-        self._buffer_size = buffer_size
-        self.device = device
-        self.num_seen_examples = 0
-        self.attributes = ['examples', 'labels', 'logits', 'task_labels', 'true_labels']
-        self.attention_maps = [None] * buffer_size
-        self.sample_selection_strategy = sample_selection_strategy
+    num_recipients = len(recipients)
 
-        assert sample_selection_strategy.lower() in ['reservoir', 'lars', 'labrs', 'abs', 'balancoir', 'unlimited'], f"Invalid sample selection strategy: {sample_selection_strategy}"
+    # Calculate the average share and remainder
+    avg_share, remainder = divmod(total_excess, num_recipients)
 
-        if sample_selection_strategy.lower() == 'abs':
-            assert 'dataset' in kwargs, "The dataset is required for ABS sample selection"
-            self.sample_selection_fn = ABSSampling(buffer_size, device, kwargs['dataset'])
-        elif sample_selection_strategy.lower() == 'lars':
-            self.sample_selection_fn = LARSSampling(buffer_size, device)
-        elif sample_selection_strategy.lower() == 'labrs':
-            self.sample_selection_fn = LossAwareBalancedSampling(buffer_size, device)
-        elif sample_selection_strategy.lower() == 'unlimited':
-            self.sample_selection_fn = lambda x: x
-            self._buffer_size = 10  # initial buffer size, will be expanded if needed
-        elif sample_selection_strategy.lower() == 'balancoir':
-            self.sample_selection_fn = BalancoirSampling(buffer_size, device)
+    lst = [val if val <= check_bound else check_bound for val in lst]
+    
+    # Distribute the average share
+    for idx in recipients:
+        lst[idx] += avg_share
+    
+    # Distribute the remainder
+    for idx in recipients[:remainder]:
+        lst[idx] += 1
+    
+    # Cap values greater than check_bound
+    for i, val in enumerate(lst):
+        if val > check_bound:
+            return distribute_excess(lst, check_bound)
+            break
+
+    return lst
+
+
+def adjust_values_integer_include_all(a, b):
+    excess = {}
+    shortage = {}
+    total_excess = 0
+
+    # Establish initial excess and shortage based on the limits in b
+    for k in a:
+        if k in b:
+            if a[k] > b[k]:
+                excess[k] = a[k] - b[k]
+                total_excess += a[k] - b[k]
+                a[k] = b[k]  # Adjust to the limit of b
+            elif a[k] < b[k]:
+                shortage[k] = b[k] - a[k]  # Available space to increase
         else:
-            self.sample_selection_fn = ReservoirSampling(buffer_size, device)
+            # If no corresponding key in b, treat as having no upper limit
+            shortage[k] = float('inf')  # Theoretically unlimited capacity
 
-    def serialize(self, out_device='cpu'):
-        """
-        Serialize the buffer.
-
-        Returns:
-            A dictionary containing the buffer attributes.
-        """
-        return {attr_str: getattr(self, attr_str).to(out_device) for attr_str in self.attributes if hasattr(self, attr_str)}
-
-    def to(self, device):
-        """
-        Move the buffer and its attributes to the specified device.
-
-        Args:
-            device: The device to move the buffer and its attributes to.
-
-        Returns:
-            The buffer instance with the updated device and attributes.
-        """
-        self.device = device
-        self.sample_selection_fn.device = device
-        for attr_str in self.attributes:
-            if hasattr(self, attr_str):
-                setattr(self, attr_str, getattr(self, attr_str).to(device))
-        return self
-
-    def __len__(self):
-        """
-        Returns the number items in the buffer.
-        """
-        if self.sample_selection_strategy == 'unlimited':
-            return self.num_seen_examples
-        return min(self.num_seen_examples, self.buffer_size)
-
-    def init_tensors(self, examples: torch.Tensor, labels: torch.Tensor,
-                     logits: torch.Tensor, task_labels: torch.Tensor,
-                     true_labels: torch.Tensor) -> None:
-        """
-        Initializes just the required tensors.
-
-        Args:
-            examples: tensor containing the images
-            labels: tensor containing the labels
-            logits: tensor containing the outputs of the network
-            task_labels: tensor containing the task labels
-            true_labels: tensor containing the true labels (used only for logging)
-        """
-        for attr_str in self.attributes:
-            attr = eval(attr_str)
-            if attr is not None and not hasattr(self, attr_str):  # create tensor if not already present
-                typ = torch.int64 if attr_str.endswith('els') else torch.float32
-                setattr(self, attr_str, torch.zeros((self._buffer_size,
-                        *attr.shape[1:]), dtype=typ, device=self.device))
-            elif hasattr(self, attr_str):  # if tensor already exists, update it and possibly resize it according to the buffer_size
-                if self.num_seen_examples < self._buffer_size:  # if the buffer is full, extend the tensor
-                    old_tensor = getattr(self, attr_str)
-                    pad = torch.zeros((self._buffer_size - old_tensor.shape[0], *attr.shape[1:]), dtype=old_tensor.dtype, device=self.device)
-                    setattr(self, attr_str, torch.cat([old_tensor, pad], dim=0))
-
-    @property
-    def buffer_size(self):
-        """
-        Returns the buffer size.
-        """
-        if self.sample_selection_strategy == 'unlimited':
-            # return max int if unlimited
-            return int(1e9)
-        return self._buffer_size
-
-    @buffer_size.setter
-    def buffer_size(self, value):
-        """
-        Sets the buffer size.
-        """
-        if self.sample_selection_strategy != 'unlimited':
-            self._buffer_size = value
-
-    @property
-    def used_attributes(self):
-        """
-        Returns a list of attributes that are currently being used by the object.
-        """
-        return [attr_str for attr_str in self.attributes if hasattr(self, attr_str)]
-
-    def is_full(self):
-        return self.num_seen_examples >= self.buffer_size
-
-    def add_data(self, examples, labels=None, logits=None, task_labels=None, attention_maps=None, true_labels=None, sample_selection_scores=None):
-        """
-        Adds the data to the memory buffer according to the reservoir strategy.
-
-        Args:
-            examples: tensor containing the images
-            labels: tensor containing the labels
-            logits: tensor containing the outputs of the network
-            task_labels: tensor containing the task labels
-            attention_maps: list of tensors containing the attention maps
-            true_labels: if setting is noisy, the true labels associated with the examples. **Used only for logging.**
-            sample_selection_scores: tensor containing the scores used for the sample selection strategy. NOTE: this is only used if the sample selection strategy defines the `update` method.
-
-        Note:
-            Only the examples are required. The other tensors are initialized only if they are provided.
-        """
-        if not hasattr(self, 'examples'):
-            self.init_tensors(examples, labels, logits, task_labels, true_labels)
-
-        for i in range(examples.shape[0]):
-            if self.sample_selection_strategy == 'abs' or self.sample_selection_strategy == 'labrs':
-                index = self.sample_selection_fn(self.num_seen_examples, labels=self.labels)
-            elif self.sample_selection_strategy == 'balancoir':
-                index = self.sample_selection_fn(self.num_seen_examples, labels=self.labels, proposed_class=labels[i])
+    # Distribute the excess to those under the limit as integers
+    while total_excess > 0 and shortage:
+        per_key_excess = max(total_excess // len(shortage), 1)  # Ensure minimal distribution
+        for k in list(shortage):
+            if total_excess == 0:
+                break
+            if shortage[k] == float('inf'):
+                increment = per_key_excess  # No limit, so use per_key_excess
             else:
-                index = self.sample_selection_fn(self.num_seen_examples)
-            self.num_seen_examples += 1
-            if index >= 0:
-                if self.sample_selection_strategy == 'unlimited' and self.num_seen_examples > self._buffer_size:
-                    self._buffer_size *= 2
-                    self.init_tensors(examples, labels, logits, task_labels, true_labels)
-                if self.sample_selection_strategy == 'balancoir':
-                    self.sample_selection_fn.update_unique_map(labels[i], self.labels[index] if index < self.num_seen_examples else None)
+                increment = min(shortage[k], per_key_excess)
 
-                self.examples[index] = examples[i].to(self.device)
-                if labels is not None:
-                    self.labels[index] = labels[i].to(self.device)
-                if logits is not None:
-                    self.logits[index] = logits[i].to(self.device)
-                if task_labels is not None:
-                    self.task_labels[index] = task_labels[i].to(self.device)
-                if attention_maps is not None:
-                    self.attention_maps[index] = [at[i].byte().to(self.device) for at in attention_maps]
-                if sample_selection_scores is not None:
-                    self.sample_selection_fn.update(index, sample_selection_scores[i])
-                if true_labels is not None:
-                    self.true_labels[index] = true_labels[i].to(self.device)
+            a[k] += increment
+            total_excess -= increment
 
-    def get_data(self, size: int, transform: nn.Module = None, return_index=False, device=None,
-                 mask_task_out=None, cpt=None, return_not_aug=False, not_aug_transform=None, force_indexes=None) -> Tuple:
-        """
-        Random samples a batch of size items.
+            if shortage[k] != float('inf'):
+                shortage[k] -= increment
+                if shortage[k] == 0:
+                    del shortage[k]  # Remove key from shortage if fully adjusted
 
-        Args:
-            size: the number of requested items
-            transform: the transformation to be applied (data augmentation)
-            return_index: if True, returns the indexes of the sampled items
-            mask_task: if not None, masks OUT the examples from the given task
-            cpt: the number of classes per task (required if mask_task is not None and task_labels are not present)
-            return_not_aug: if True, also returns the not augmented items
-            not_aug_transform: the transformation to be applied to the not augmented items (if `return_not_aug` is True)
-            forced_indexes: if not None, forces the selection of the samples with the given indexes
+    # Ensure all values are integers
+    for key in a:
+        a[key] = int(a[key])
 
-        Returns:
-            a tuple containing the requested items. If return_index is True, the tuple contains the indexes as first element.
-        """
-        target_device = self.device if device is None else device
+    return a
 
-        if mask_task_out is not None:
-            assert hasattr(self, 'task_labels') or cpt is not None
-            assert hasattr(self, 'task_labels') or hasattr(self, 'labels')
-            samples_mask = (self.task_labels != mask_task_out) if hasattr(self, 'task_labels') else self.labels // cpt != mask_task_out
 
-        num_avail_samples = self.examples.shape[0] if mask_task_out is None else samples_mask.sum().item()
-        num_avail_samples = min(self.num_seen_examples, num_avail_samples)
+class Acr(ContinualModel):
+    NAME = 'acr'
+    COMPATIBILITY = ['class-il']
 
-        if size > min(num_avail_samples, self.examples.shape[0]):
-            size = min(num_avail_samples, self.examples.shape[0])
+    def __init__(self, backbone, loss, args, transform):
+        super(Acr, self).__init__(backbone, loss, args, transform)
+        self.buffer = Buffer(self.args.buffer_size, self.device)
+        self.task = 0
+        self.epoch = 0
+        self.unique_classes = set()
+        self.mapping = {}
+        self.reverse_mapping = {}
+        self.confidence_by_sample = None
+        self.n_sample_per_task = None
+        self.class_portion = []
+        self.dist_task_prev = None
+        self.dist_class_prev = None
+        self.class_weights_ = {}
 
-        if force_indexes is not None:
-            choice = force_indexes if isinstance(force_indexes, np.ndarray) else np.array(force_indexes)
+    def begin_train(self, dataset):
+        self.n_sample_per_task = dataset.get_examples_number()//dataset.N_TASKS
+    
+    def begin_task(self, dataset, train_loader):
+        self.epoch = 0
+        self.task += 1
+        self.unique_classes = set()
+        for _, labels, _, _ in train_loader:
+            self.unique_classes.update(labels.numpy())
+            if len(self.unique_classes)==dataset.N_CLASSES_PER_TASK:
+                break
+        self.mapping = {value: index for index, value in enumerate(self.unique_classes)}
+        self.reverse_mapping = {index: value for value, index in self.mapping.items()}
+        self.confidence_by_sample = torch.zeros((self.args.n_epochs, self.n_sample_per_task))
+        ##self.class_weights_ = {i: (1.0 if i >= ((self.task - 1)*dataset.N_CLASSES_PER_TASK) else (1.0/(self.task - 1)) * (1.0/(self.task - (i // dataset.N_CLASSES_PER_TASK))) * (self.args.buffer_size/self.n_sample_per_task)) for i in range(self.task * dataset.N_CLASSES_PER_TASK)}
+        self.class_weights_ = {i: 1.0 for i in range(self.task * dataset.N_CLASSES_PER_TASK)}
+    
+    def end_epoch(self, dataset, train_loader):
+        
+        self.epoch += 1
+        
+        if self.epoch == self.args.n_epochs:
+            
+            # Calculate standard deviation of mean confidences by class
+            std_of_means_by_class = {class_id: 1 for class_id, __ in enumerate(self.unique_classes)}
+            std_of_means_by_task = {task_id: 1 for task_id in range(self.task)}
+            
+            # Compute mean and variability of confidences for each sample
+            Confidence_mean = self.confidence_by_sample[:self.args.E].mean(dim=0)
+            Variability = self.confidence_by_sample[:self.args.E].var(dim=0)
+            
+        
+            # Sort indices based on the Confidence
+            ##sorted_indices_1 = np.argsort(Confidence_mean.numpy())
+            
+            # Sort indices based on the variability
+            sorted_indices_2 = np.argsort(Variability.numpy())
+            
+        
+            ##top_indices_sorted = sorted_indices_1 #hard
+            
+            ##top_indices_sorted = sorted_indices_1[::-1].copy() #simple
+        
+            # Descending order
+            top_indices_sorted = sorted_indices_2[::-1].copy() #challenging
+
+            
+            # Convert standard deviation of means by class to item form
+            updated_std_of_means_by_class = {self.reverse_mapping[k]: 1 for k, _ in std_of_means_by_class.items()}   #uncomment for balance
+
+            self.class_portion.append(updated_std_of_means_by_class)
+            
+            updated_std_of_means_by_task = {k: 1 for k, v in std_of_means_by_task.items()}    #uncomment for balance
+            dist_task_before = distribute_samples(updated_std_of_means_by_task, self.args.buffer_size)
+            
+            if self.task > 1:
+                dist_task = adjust_values_integer_include_all(dist_task_before.copy(), self.dist_task_prev)
+            else:
+                dist_task = dist_task_before
+            
+            dist_class = [distribute_samples(self.class_portion[i], dist_task[i]) for i in range(self.task)]
+            
+            self.dist_task_prev = dist_task
+            
+            # Distribute samples based on the standard deviation
+            dist = dist_class.pop()
+            dist_last = dist.copy()
+            dist = {self.mapping[k]: v for k, v in dist.items()}
+
+            
+            # Initialize a counter for each class
+            counter_class = [0 for _ in range(len(self.unique_classes))]
+        
+            # Distribution based on the class variability
+            condition = [dist[k] for k in range(len(dist))]
+        
+            # Check if any class exceeds its allowed number of samples
+            check_bound = self.n_sample_per_task//len(self.unique_classes)
+            for i in range(len(condition)):
+                if condition[i] > check_bound:
+                    # Redistribute the excess samples
+                    condition = distribute_excess(condition, check_bound)
+                    break
+        
+            # Assuming train_loader is defined and each batch consists of (inputs, labels)
+            class_samples = defaultdict(list)
+            
+            for inputs_1, labels_1, not_aug_inputs_1, indices_1 in train_loader:
+                for input, label in zip(not_aug_inputs_1, labels_1):
+                    class_samples[label.item()].append((input, label))
+
+            desired_samples = condition
+            selected_data = []
+            
+            for label, samples in class_samples.items():
+                n_samples = desired_samples[self.mapping[label]]
+                if len(samples) >= n_samples:
+                    selected_data.extend(random.sample(samples, n_samples))
+                else:
+                    print(f"Not enough samples for class {label}, needed {n_samples}, but got {len(samples)}")
+
+
+            # Extracting images and labels into separate lists
+            images11 = [data[0] for data in selected_data]  # data[0] is the image tensor
+            labels11 = [data[1] for data in selected_data]  # data[1] is the label tensor
+
+            # Convert lists of tensors to single tensors
+            all_images_ = torch.stack(images11, dim=0).to(self.device)  # Stacks along a new dimension
+            all_labels_ = torch.stack(labels11, dim=0).to(self.device)  # Stacks along a new dimension
+        
+            
+            counter_manage = [{k:0 for k, __ in dist_class[i].items()} for i in range(self.task - 1)]
+
+            dist_class_merged = {}
+            counter_manage_merged = {}
+            dist_class_merged_prev = {}
+            
+            for d in dist_class:
+                dist_class_merged.update(d)
+            for f in counter_manage:
+                counter_manage_merged.update(f)
+            if self.task > 1:
+                dist_class_merged_prev = self.dist_class_prev
+                class_key = list(dist_class_merged.keys())
+                temp_key = -1
+                for k, value in dist_class_merged.items():
+                    temp_key += 1
+                    if value > dist_class_merged_prev[k]:
+                        temp = value - dist_class_merged_prev[k]
+                        dist_class_merged[k] -= temp
+                        for hh in range(temp):
+                            dist_class_merged[class_key[temp_key + hh + 1]] += 1
+            
+            self.dist_class_prev = dist_class_merged.copy()
+            self.dist_class_prev.update(dist_last)
+            if not self.buffer.is_empty():
+                # Assuming train_loader is defined and each batch consists of (inputs, labels)
+                class_samples_buffer = defaultdict(list)
+                
+                for input, label in zip(self.buffer.examples, self.buffer.labels):
+                    class_samples_buffer[label.item()].append((input, label))
+    
+                desired_samples_buffer = dist_class_merged
+                selected_data_buffer = []
+                
+                for label, samples in class_samples_buffer.items():
+                    n_samples = desired_samples_buffer[label]
+                    if len(samples) >= n_samples:
+                        selected_data_buffer.extend(random.sample(samples, n_samples))
+                    else:
+                        print(f"Not enough samples for class {label}, needed {n_samples}, but got {len(samples)}")
+    
+    
+                # Extracting images and labels into separate lists
+                images11_buffer = [data[0] for data in selected_data_buffer]  # data[0] is the image tensor
+                labels11_buffer = [data[1] for data in selected_data_buffer]  # data[1] is the label tensor
+    
+                # Convert lists of tensors to single tensors
+                images_store_ = torch.stack(images11_buffer, dim=0).to(self.device)  # Stacks along a new dimension
+                labels_store_ = torch.stack(labels11_buffer, dim=0).to(self.device)  # Stacks along a new dimension
+
+
+                all_images_ = torch.cat((images_store_, all_images_))
+                all_labels_ = torch.cat((labels_store_, all_labels_))
+
+            if not hasattr(self.buffer, 'examples'):
+                self.buffer.init_tensors(all_images_, all_labels_, None, None)
+            
+            self.buffer.num_seen_examples += self.n_sample_per_task
+            
+            # Update the buffer with the shuffled images and labels
+            self.buffer.labels = all_labels_
+            self.buffer.examples = all_images_
+    
+
+    def observe(self, inputs, labels, not_aug_inputs, index_):
+        
+        real_batch_size = inputs.shape[0]
+        
+        # batch update
+        batch_x, batch_y = inputs, labels
+        batch_x_aug = torch.stack([transforms_aug[self.args.dataset](batch_x[idx].cpu())
+                                   for idx in range(batch_x.size(0))])
+        batch_x = batch_x.to(self.device)
+        batch_x_aug = batch_x_aug.to(self.device)
+        batch_y = batch_y.to(self.device)
+        ##batch_x_combine = torch.cat((batch_x, batch_x_aug))
+        batch_x_combine = batch_x
+        ##batch_y_combine = torch.cat((batch_y, batch_y))
+        batch_y_combine = batch_y
+            
+        logits, feas= self.net.pcrForward(batch_x_combine)
+        logits_aug, feas_aug= self.net.pcrForward(batch_x_aug)
+        novel_loss = 0*self.loss(logits, batch_y_combine)
+        self.opt.zero_grad()
+
+        if self.epoch < self.args.E:
+            targets = torch.tensor([self.mapping[val.item()] for val in labels]).to(self.device)
+            confidence_batch = []
+            self.net.eval()
+            with torch.no_grad():
+                acr_logits, _ = self.net.pcrForward(not_aug_inputs)
+                soft_ = nn.functional.softmax(acr_logits, dim=1)
+                # Accumulate confidences
+                for i in range(targets.shape[0]):
+                    confidence_batch.append(soft_[i,labels[i]].item())
+                
+                # Record the confidence scores for samples in the corresponding tensor
+                conf_tensor = torch.tensor(confidence_batch)
+                self.confidence_by_sample[self.epoch, index_] = conf_tensor
+            self.net.train()
+    
+        
+        if self.buffer.is_empty():
+                            
+            if self.epoch > 2:
+                PSC = SupConLoss(temperature=0.09, contrast_mode='all')
+                novel_loss += 0.5 * PSC(features=torch.cat([F.normalize(feas, p=2, dim=1, eps=1e-6).unsqueeze(1), 
+                                                      F.normalize(feas_aug, p=2, dim=1, eps=1e-6).unsqueeze(1)], dim=1), labels=batch_y_combine)
+
+            # Compute proxy loss but detach 'feas' so encoder does not get gradients
+            with torch.no_grad():
+                # we want to freeze encoder → treat feas as constant for this loss
+                frozen_feas = feas.detach()
+
+            weighted_loss = WeightedProxyContrastiveLoss(temperature=0.09, class_weights=self.class_weights_)
+            novel_loss += weighted_loss(frozen_feas, batch_y_combine, self.net.pcrLinear.L.weight)
+            
         else:
-            choice = np.random.choice(num_avail_samples, size=size, replace=False)
-        if transform is None:
-            def transform(x): return x
+            mem_x, mem_y = self.buffer.get_data(
+                self.args.minibatch_size, transform=self.transform)
+        
+            mem_x_aug = torch.stack([transforms_aug[self.args.dataset](mem_x[idx].cpu())
+                                     for idx in range(mem_x.size(0))])
+            mem_x = mem_x.to(self.device)
+            mem_x_aug = mem_x_aug.to(self.device)
+            mem_y = mem_y.to(self.device)
+            ##mem_x_combine = torch.cat([mem_x, mem_x_aug])
+            mem_x_combine = mem_x
+            ##mem_y_combine = torch.cat([mem_y, mem_y])
+            mem_y_combine = mem_y
 
-        selected_samples = self.examples[choice] if mask_task_out is None else self.examples[samples_mask][choice]
+            mem_logits, mem_fea= self.net.pcrForward(mem_x_combine)
+            mem_logits_aug, mem_fea_aug= self.net.pcrForward(mem_x_aug)
 
-        if return_not_aug:
-            if not_aug_transform is None:
-                def not_aug_transform(x): return x
-            ret_tuple = (apply_transform(selected_samples, transform=not_aug_transform).to(target_device),)
-        else:
-            ret_tuple = tuple()
+            combined_feas = torch.cat([mem_fea, feas])
+            combined_feas_aug = torch.cat([mem_fea_aug, feas_aug])
+            combined_labels = torch.cat((mem_y_combine, batch_y_combine))
+                            
+            if self.epoch > 2:
+                PSC = SupConLoss(temperature=0.09, contrast_mode='all')
+                novel_loss += 0.5 * PSC(features=torch.cat([F.normalize(combined_feas, p=2, dim=1, eps=1e-6).unsqueeze(1), 
+                                                      F.normalize(combined_feas_aug, p=2, dim=1, eps=1e-6).unsqueeze(1)], dim=1), labels=combined_labels)
 
-        ret_tuple += (apply_transform(selected_samples, transform=transform).to(target_device),)
-        for attr_str in self.attributes[1:]:
-            if hasattr(self, attr_str):
-                attr = getattr(self, attr_str)
-                selected_attr = attr[choice] if mask_task_out is None else attr[samples_mask][choice]
-                ret_tuple += (selected_attr.to(target_device),)
+            # Compute proxy loss but detach 'feas' so encoder does not get gradients
+            with torch.no_grad():
+                # we want to freeze encoder → treat feas as constant for this loss
+                frozen_combined_feas = combined_feas.detach()
+            
+            weighted_loss = WeightedProxyContrastiveLoss(temperature=0.09, class_weights=self.class_weights_)
+            novel_loss += weighted_loss(frozen_combined_feas, combined_labels, self.net.pcrLinear.L.weight)
 
-        if not return_index:
-            return ret_tuple
-        else:
-            return (torch.tensor(choice).to(target_device), ) + ret_tuple
-
-    def get_balanced_data(self, size: int, transform=None, n_classes=-1) -> Tuple:
-        """
-        Random samples a batch of size items only from n_classes, balancing the samples per class.
-
-        Args:
-            size: the number of requested items
-            transform: the transformation to be applied (data augmentation)
-            n_classes: the number of classes to sample from
-
-        Returns:
-            a tuple containing the requested items.
-        """
-        if size > min(self.num_seen_examples, self.examples.shape[0]):
-            size = min(self.num_seen_examples, self.examples.shape[0])
-
-        tot_classes, class_counts = torch.unique(self.labels[:self.num_seen_examples], return_counts=True)
-        if n_classes == -1:
-            n_classes = len(tot_classes)
-
-        finished = False
-        selected = tot_classes
-        while not finished:
-            n_classes = min(n_classes, len(selected))
-            size_per_class = torch.full([n_classes], size // n_classes)
-            size_per_class[:size % n_classes] += 1
-            selected = tot_classes[class_counts >= size_per_class[0]]
-            if n_classes <= len(selected):
-                finished = True
-            if len(selected) == 0:
-                logging.error('No class has enough examples')
-                return self.get_data(size, transform=transform)
-
-        selected = selected[torch.randperm(len(selected))[:n_classes]]
-
-        choice = []
-        for i, id_class in enumerate(selected):
-            choice += np.random.choice(torch.where(self.labels[:self.num_seen_examples] == id_class)[0].cpu(),
-                                       size=size_per_class[i].item(),
-                                       replace=False).tolist()
-        choice = np.array(choice)
-
-        if transform is None:
-            def transform(x): return x
-        # ret_tuple = (torch.stack([transform(ee.cpu()) for ee in self.examples[choice]]).to(self.device),)
-        ret_tuple = (apply_transform(self.examples[choice], transform=transform).to(self.device),)
-        for attr_str in self.attributes[1:]:
-            if hasattr(self, attr_str):
-                attr = getattr(self, attr_str)
-                ret_tuple += (attr[choice],)
-
-        return ret_tuple
-
-    def get_data_by_index(self, indexes, transform: nn.Module = None, device=None) -> Tuple:
-        """
-        Returns the data by the given index.
-
-        Args:
-            index: the index of the item
-            transform: the transformation to be applied (data augmentation)
-
-        Returns:
-            a tuple containing the requested items. The returned items depend on the attributes stored in the buffer from previous calls to `add_data`.
-        """
-        target_device = self.device if device is None else device
-
-        if transform is None:
-            def transform(x): return x
-        ret_tuple = (apply_transform(self.examples[indexes], transform=transform).to(target_device),)
-        for attr_str in self.attributes[1:]:
-            if hasattr(self, attr_str):
-                attr = getattr(self, attr_str).to(target_device)
-                ret_tuple += (attr[indexes],)
-        return ret_tuple
-
-    def is_empty(self) -> bool:
-        """
-        Returns true if the buffer is empty, false otherwise.
-        """
-        if self.num_seen_examples == 0:
-            return True
-        else:
-            return False
-
-    def get_all_data(self, transform: nn.Module = None, device=None) -> Tuple:
-        """
-        Return all the items in the memory buffer.
-
-        Args:
-            transform: the transformation to be applied (data augmentation)
-
-        Returns:
-            a tuple with all the items in the memory buffer
-        """
-        target_device = self.device if device is None else device
-        if transform is None:
-            ret_tuple = (self.examples[:len(self)].to(target_device),)
-        else:
-            ret_tuple = (apply_transform(self.examples[:len(self)], transform=transform).to(target_device),)
-        for attr_str in self.attributes[1:]:
-            if hasattr(self, attr_str):
-                attr = getattr(self, attr_str)[:len(self)].to(target_device)
-                ret_tuple += (attr,)
-        return ret_tuple
-
-    def empty(self) -> None:
-        """
-        Set all the tensors to None.
-        """
-        for attr_str in self.attributes:
-            if hasattr(self, attr_str):
-                delattr(self, attr_str)
-        self.num_seen_examples = 0
-
-    def __iter__(self):
-        """
-        Initializes and returns a iterator object for the buffer.
-        """
-        self._it_index = 0
-
-        return self
-
-    def __next__(self):
-        """
-        Returns the next item in the buffer.
-        """
-        if self._it_index >= self.__len__():
-            raise StopIteration
-        return self.__getitem__(self._it_index, transform=self._dl_transform)
-
-    def get_dataloader(self, args: Namespace, batch_size: int, shuffle=False, drop_last=False, transform=None, sampler=None) -> torch.utils.data.DataLoader:
-        """
-        Return a DataLoader for the buffer.
-
-        Args:
-            args: the arguments from the CLI
-            batch_size: the batch size
-            shuffle: if True, shuffle the data
-            drop_last: if True, drop the last incomplete batch
-            transform: the transformation to be applied (data augmentation)
-            sampler: the sampler to be used
-
-        Returns:
-            DataLoader
-        """
-        self._dl_transform = transform
-        self._it_index = 0
-
-        return create_seeded_dataloader(args, self, batch_size=batch_size,
-                                        shuffle=shuffle, drop_last=drop_last,
-                                        sampler=sampler, num_workers=0,
-                                        non_verbose=True)
-
-    def __getitem__(self, index, transform=None):
-        """
-        Returns the item in the buffer at the given index.
-
-        Args:
-            index: the index of the item
-            transform: (optional) a transformation to be applied
-
-        Returns:
-            a tuple containing the requested items. The returned items depend on the attributes stored in the buffer from previous calls to `add_data`.
-        """
-        data = self.get_data(size=1, transform=transform if self._dl_transform is None or transform is not None else self._dl_transform, force_indexes=[index])
-
-        return [d.squeeze(0) for d in data]
-
-
-@torch.no_grad()
-def fill_buffer(buffer: Buffer, dataset: 'ContinualDataset', t_idx: int, net: 'MammothBackbone' = None, use_herding=False,
-                required_attributes: List[str] = None, normalize_features=False, extend_equalize_buffer=False) -> None:
-    """
-    Adds examples from the current task to the memory buffer.
-    Supports images, labels, task_labels, and logits.
-
-    Args:
-        buffer: the memory buffer
-        dataset: the dataset from which take the examples
-        t_idx: the task index
-        net: (optional) the model instance. Used if logits are in buffer. If provided, adds logits.
-        use_herding: (optional) if True, uses herding strategy. Otherwise, random sampling.
-        required_attributes: (optional) the attributes to be added to the buffer. If None and buffer is empty, adds only examples and labels.
-        normalize_features: (optional) if True, normalizes the features before adding them to the buffer
-        extend_equalize_buffer: (optional) if True, extends the buffer to equalize the number of samples per class for all classes, even if that means exceeding the buffer size defined at initialization
-    """
-    if net is not None:
-        mode = net.training
-        net.eval()
-    else:
-        assert not use_herding, "Herding strategy requires a model instance"
-
-    device = net.device if net is not None else get_device()
-
-    n_seen_classes = dataset.N_CLASSES_PER_TASK * (t_idx + 1) if isinstance(dataset.N_CLASSES_PER_TASK, int) else \
-        sum(dataset.N_CLASSES_PER_TASK[:t_idx + 1])
-    n_past_classes = dataset.N_CLASSES_PER_TASK * t_idx if isinstance(dataset.N_CLASSES_PER_TASK, int) else \
-        sum(dataset.N_CLASSES_PER_TASK[:t_idx])
-
-    mask = dataset.train_loader.dataset.targets >= n_past_classes
-    dataset.train_loader.dataset.targets = dataset.train_loader.dataset.targets[mask]
-    dataset.train_loader.dataset.data = dataset.train_loader.dataset.data[mask]
-
-    buffer.buffer_size = dataset.args.buffer_size  # reset initial buffer size
-
-    if extend_equalize_buffer:
-        samples_per_class = np.ceil(buffer.buffer_size / n_seen_classes).astype(int)
-        new_bufsize = int(n_seen_classes * samples_per_class)
-        if new_bufsize != buffer.buffer_size:
-            logging.info(f'Buffer size has been changed to: {new_bufsize}')
-        buffer.buffer_size = new_bufsize
-    else:
-        samples_per_class = buffer.buffer_size // n_seen_classes
-
-    # Check for requirs attributes
-    required_attributes = required_attributes or ['examples', 'labels']
-    assert all([attr in buffer.used_attributes for attr in required_attributes]) or len(buffer) == 0, \
-        "Required attributes not in buffer: {}".format([attr for attr in required_attributes if attr not in buffer.used_attributes])
-
-    if t_idx > 0:
-        # 1) First, subsample prior classes
-        buf_data = buffer.get_all_data()
-        buf_y = buf_data[1]
-
-        buffer.empty()
-        for _y in buf_y.unique():
-            idx = (buf_y == _y)
-            _buf_data_idx = {attr_name: _d[idx][:samples_per_class] for attr_name, _d in zip(required_attributes, buf_data)}
-            buffer.add_data(**_buf_data_idx)
-
-    # 2) Then, fill with current tasks
-    loader = dataset.train_loader
-    norm_trans = dataset.get_normalization_transform()
-    if norm_trans is None:
-        def norm_trans(x): return x
-
-    if 'logits' in buffer.used_attributes:
-        assert net is not None, "Logits in buffer require a model instance"
-
-    # 2.1 Extract all features
-    a_x, a_y, a_f, a_l = [], [], [], []
-    for data in loader:
-        x, y, not_norm_x = data[0], data[1], data[2]
-        if not x.size(0):
-            continue
-        a_x.append(not_norm_x.cpu())
-        a_y.append(y.cpu())
-
-        if net is not None:
-            feats = net(norm_trans(not_norm_x.to(device)), returnt='features')
-            outs = net.classifier(feats)
-            if normalize_features:
-                feats = feats / feats.norm(dim=1, keepdim=True)
-
-            a_f.append(feats.cpu())
-            a_l.append(torch.sigmoid(outs).cpu())
-    a_x, a_y = torch.cat(a_x), torch.cat(a_y)
-    if net is not None:
-        a_f, a_l = torch.cat(a_f), torch.cat(a_l)
-
-    # 2.2 Compute class means
-    for _y in a_y.unique():
-        idx = (a_y == _y)
-        _x, _y = a_x[idx], a_y[idx]
-
-        if use_herding:
-            _l = a_l[idx]
-            feats = a_f[idx]
-            mean_feat = feats.mean(0, keepdim=True)
-
-            running_sum = torch.zeros_like(mean_feat)
-            i = 0
-            while i < samples_per_class and i < feats.shape[0]:
-                cost = (mean_feat - (feats + running_sum) / (i + 1)).norm(2, 1)
-
-                idx_min = cost.argmin().item()
-
-                buffer.add_data(
-                    examples=_x[idx_min:idx_min + 1].to(device),
-                    labels=_y[idx_min:idx_min + 1].to(device),
-                    logits=_l[idx_min:idx_min + 1].to(device) if 'logits' in required_attributes else None,
-                    task_labels=torch.ones(len(_x[idx_min:idx_min + 1])).to(device) * t_idx if 'task_labels' in required_attributes else None
-
-                )
-
-                running_sum += feats[idx_min:idx_min + 1]
-                feats[idx_min] = feats[idx_min] + 1e6
-                i += 1
-        else:
-            idx = torch.randperm(len(_x))[:samples_per_class]
-
-            buffer.add_data(
-                examples=_x[idx].to(device),
-                labels=_y[idx].to(device),
-                logits=_l[idx].to(device) if 'logits' in required_attributes else None,
-                task_labels=torch.ones(len(_x[idx])).to(device) * t_idx if 'task_labels' in required_attributes else None
-            )
-
-    assert len(buffer.examples) <= buffer.buffer_size, f"buffer overflowed its maximum size: {len(buffer)} > {buffer.buffer_size}"
-    assert buffer.num_seen_examples <= buffer.buffer_size, f"buffer has been overfilled, there is probably an error: {buffer.num_seen_examples} > {buffer.buffer_size}"
-
-    if net is not None:
-        net.train(mode)
+        
+        novel_loss.backward()
+        self.opt.step()
+        
+        return novel_loss.item()
